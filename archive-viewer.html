@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LLM Controller — Archive Viewer</title>
+
+  <!-- Reuse actual app styling -->
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="archive-viewer.css">
+
+  <script src="marked.min.js" defer></script>
+  <script src="archive-viewer.js" defer></script>
+</head>
+<body class="archive-viewer-page">
+  <div class="sidebar open">
+    <h2>
+      Archive Viewer
+      <button class="new-chat" id="pickFileBtn" title="Open export">📂</button>
+    </h2>
+
+    <div class="archive-sidebar-block">
+      <div id="dropPanel" class="archive-dropzone">
+        <div class="archive-drop-title">Drop chat export here</div>
+        <div class="archive-drop-subtitle">JSON, CSV, or Markdown</div>
+        <button type="button" class="archive-pick-btn" id="pickFileBtnSecondary">Choose File</button>
+        <input id="fileInput" type="file" accept=".json,.csv,.md,.markdown,.txt" hidden>
+      </div>
+
+      <div id="archiveMeta" class="archive-meta">
+        No archive loaded.
+      </div>
+    </div>
+
+    <ul id="chatHistory" class="archive-session-list"></ul>
+  </div>
+
+  <div class="main-content">
+    <div class="topbar archive-topbar">
+      <h1 id="appTitle">LLM Controller — Archive Viewer</h1>
+      <div class="archive-topbar-badge">read-only</div>
+    </div>
+
+    <div class="chat-container archive-chat-container">
+      <div id="chatMessages" class="chat-messages archive-chat-messages">
+        <div class="archive-empty-state">
+          <h2>No archive loaded</h2>
+          <p>Chat will load once you select a file.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
