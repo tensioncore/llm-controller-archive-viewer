@@ -17,6 +17,10 @@ LLM Controller Archive Viewer is a lightweight standalone tool for opening expor
 
 Early standalone release.
 
+## GUI
+
+<IMG SRC="hero.png">
+
 ## Related Projects
 
 - [LLM Controller CE](https://github.com/tensioncore/llm-controller-ce)
