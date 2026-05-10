@@ -212,6 +212,20 @@ body.archive-viewer-page .chat-container {
   gap: 8px 14px;
 }
 
+.archive-status-pill {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 0.92em;
+  line-height: 1.45;
+}
+
+.archive-inactive-pill {
+  color: #ffd7a8;
+  background: #3c2c1e;
+  border: 1px solid #7f5c32;
+}
+
 .archive-bubble-wrap {
   max-width: 900px;
   margin: 0 auto;
@@ -245,6 +259,37 @@ body.archive-viewer-page .chat-container {
 .archive-bubble-body code {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.archive-attachment-note {
+  max-width: 760px;
+  margin: -4px 16px 14px auto;
+  padding: 9px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  background: #202b41;
+  border: 1px solid #355179;
+  border-radius: 10px;
+  color: #d8e8ff;
+  font-family: "Open Sans", "Segoe UI", Arial, sans-serif;
+  font-size: 0.9em;
+  line-height: 1.35;
+}
+
+.archive-attachment-note strong,
+.archive-attachment-note small {
+  display: block;
+}
+
+.archive-attachment-note small {
+  color: #a9bddb;
+  margin-top: 2px;
+}
+
+.archive-attachment-icon {
+  flex: 0 0 auto;
+  line-height: 1.25;
 }
 
 .archive-footer {

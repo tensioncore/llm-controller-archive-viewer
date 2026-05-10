@@ -83,6 +83,7 @@
 
     const trimmed = text.trim();
     if (trimmed.startsWith("[") || trimmed.startsWith("{")) return "json";
+    if (/llm-controller-markdown-export:\s*escaped-table-v1/i.test(trimmed)) return "markdown";
     if (trimmed.includes(",") && trimmed.includes("session_id")) return "csv";
     return "markdown";
   }
@@ -106,6 +107,9 @@
   }
 
   function normalizeMarkdown(text, fileName) {
+    const tableRows = parseCoreMarkdownTable(text);
+    if (tableRows) return buildSessionsFromRows(tableRows);
+
     const lines = text.replace(/\r\n/g, "\n").split("\n");
     const sessions = [];
     let currentSession = null;
@@ -114,7 +118,12 @@
 
     function flushMessage() {
       if (!currentSession || !currentMsg) return;
-      if (!hasValue(currentMsg.user_message) && !hasValue(currentMsg.bot_response) && !hasValue(currentMsg.thoughts)) {
+      if (
+        !hasValue(currentMsg.user_message) &&
+        !hasValue(currentMsg.bot_response) &&
+        !hasValue(currentMsg.thoughts) &&
+        !hasAttachmentContext(currentMsg.attachment_context)
+      ) {
         currentMsg = null;
         mode = null;
         return;
@@ -180,6 +189,18 @@
         continue;
       }
 
+      if (/^###\s+Attachment Context/i.test(line) || /^\*\*Attachment Context:\*\*/i.test(line) || /^\*\*attachment_context:\*\*/i.test(line) || /^attachment_context\s*:/i.test(line)) {
+        if (!currentMsg) currentMsg = blankMsg();
+        mode = "attachment_context";
+        const inline = line
+          .replace(/^###\s+Attachment Context\s*:?\s*/i, "")
+          .replace(/^\*\*Attachment Context:\*\*\s*/i, "")
+          .replace(/^\*\*attachment_context:\*\*\s*/i, "")
+          .replace(/^attachment_context\s*:\s*/i, "");
+        if (inline) currentMsg.attachment_context += inline;
+        continue;
+      }
+
       if (/^\*\*Timestamp:\*\*/i.test(line)) {
         if (!currentMsg) currentMsg = blankMsg();
         currentMsg.timestamp = parseTimestamp(line.replace(/^\*\*Timestamp:\*\*\s*/i, ""));
@@ -200,6 +221,8 @@
         currentMsg.bot_response += (currentMsg.bot_response ? "\n" : "") + rawLine;
       } else if (mode === "thoughts") {
         currentMsg.thoughts += (currentMsg.thoughts ? "\n" : "") + rawLine;
+      } else if (mode === "attachment_context") {
+        currentMsg.attachment_context += (currentMsg.attachment_context ? "\n" : "") + rawLine;
       }
     }
 
@@ -261,6 +284,114 @@
       });
   }
 
+  function parseCoreMarkdownTable(text) {
+    const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+    const escapedCoreTable = /llm-controller-markdown-export:\s*escaped-table-v1/i.test(String(text || ""));
+    const firstTableLine = lines.findIndex(line => isMarkdownTableRow(line));
+    if (firstTableLine < 0) return null;
+
+    const headerLine = lines[firstTableLine];
+    const separatorLine = lines[firstTableLine + 1] || "";
+    if (!isMarkdownTableRow(headerLine) || !isMarkdownTableSeparator(separatorLine)) {
+      return null;
+    }
+
+    const headers = splitMarkdownTableRow(headerLine).map(h => h.trim());
+    if (!isCoreExportHeader(headers)) return null;
+
+    const rows = [];
+    for (let i = firstTableLine + 2; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      if (!isMarkdownTableRow(line)) break;
+
+      let cells = splitMarkdownTableRow(line);
+      if (!cells.length) continue;
+      if (cells.length > headers.length) {
+        cells = cells.slice(0, headers.length - 1).concat(cells.slice(headers.length - 1).join("|"));
+      }
+
+      const row = {};
+      headers.forEach((header, idx) => {
+        const cell = cells[idx] != null ? cells[idx] : "";
+        row[header] = escapedCoreTable ? decodeMarkdownTableCell(cell) : cell.trim();
+      });
+      rows.push(row);
+    }
+
+    return rows.length ? rows : null;
+  }
+
+  function isCoreExportHeader(headers) {
+    const names = new Set(headers);
+    return names.has("session_id") && names.has("user_message") && names.has("bot_response");
+  }
+
+  function isMarkdownTableRow(line) {
+    const trimmed = String(line || "").trim();
+    return trimmed.startsWith("|") && trimmed.endsWith("|");
+  }
+
+  function isMarkdownTableSeparator(line) {
+    if (!isMarkdownTableRow(line)) return false;
+    const cells = splitMarkdownTableRow(line);
+    return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell.trim()));
+  }
+
+  function splitMarkdownTableRow(line) {
+    let raw = String(line || "").trim();
+    if (raw.startsWith("|")) raw = raw.slice(1);
+    if (raw.endsWith("|")) raw = raw.slice(0, -1);
+
+    const cells = [];
+    let cell = "";
+    let escaped = false;
+
+    for (const ch of raw) {
+      if (ch === "|" && !escaped) {
+        cells.push(cell);
+        cell = "";
+        continue;
+      }
+
+      cell += ch;
+      if (ch === "\\" && !escaped) {
+        escaped = true;
+      } else {
+        escaped = false;
+      }
+    }
+
+    cells.push(cell);
+    return cells;
+  }
+
+  function decodeMarkdownTableCell(cell) {
+    const raw = String(cell || "");
+    let out = "";
+
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+      if (ch !== "\\" || i === raw.length - 1) {
+        out += ch;
+        continue;
+      }
+
+      const next = raw[++i];
+      if (next === "n") {
+        out += "\n";
+      } else if (next === "r") {
+        out += "\r";
+      } else if (next === "|" || next === "\\") {
+        out += next;
+      } else {
+        out += next;
+      }
+    }
+
+    return out;
+  }
+
   function buildSessionsFromRows(rows) {
     const bySession = new Map();
 
@@ -289,7 +420,8 @@
       const isHeaderish =
         !hasValue(row.user_message) &&
         !hasValue(row.bot_response) &&
-        !hasValue(row.thoughts);
+        !hasValue(row.thoughts) &&
+        !hasAttachmentContext(row.attachment_context);
 
       if (!isHeaderish) {
         session.messages.push(cleanMessage(row));
@@ -314,9 +446,15 @@
       user_message: pick(raw, ["user_message", "userMessage", "prompt", "user"]),
       bot_response: pick(raw, ["bot_response", "botResponse", "response", "assistant"]),
       thoughts: pick(raw, ["thoughts", "reasoning", "thinking"]),
+      attachment_context: pick(raw, ["attachment_context", "attachmentContext"]),
       timestamp: parseTimestamp(pick(raw, ["timestamp", "time", "created_at", "createdAt"])),
       model_used: pick(raw, ["model_used", "modelUsed", "model"]),
       prompt_id: pick(raw, ["prompt_id", "promptId"]),
+      turn_id: pick(raw, ["turn_id", "turnId"]),
+      prompt_version: pick(raw, ["prompt_version", "promptVersion"]),
+      response_version: pick(raw, ["response_version", "responseVersion"]),
+      active_in_chat: pick(raw, ["active_in_chat", "activeInChat"]),
+      source_row_id: pick(raw, ["source_row_id", "sourceRowId"]),
       response_time: toNumber(pick(raw, ["response_time", "responseTime"])),
       total_tokens: toNumber(pick(raw, ["total_tokens", "totalTokens"])),
       tps: toNumber(pick(raw, ["tps"])),
@@ -330,9 +468,15 @@
       user_message: toStringOrNull(row.user_message),
       bot_response: toStringOrNull(row.bot_response),
       thoughts: toStringOrNull(row.thoughts),
+      attachment_context: normalizeAttachmentContext(row.attachment_context),
       timestamp: parseTimestamp(row.timestamp),
       model_used: toStringOrNull(row.model_used),
       prompt_id: toStringOrNull(row.prompt_id),
+      turn_id: toStringOrNull(row.turn_id),
+      prompt_version: normalizeVersion(row.prompt_version),
+      response_version: normalizeVersion(row.response_version),
+      active_in_chat: normalizeActiveInChat(row.active_in_chat),
+      source_row_id: toStringOrNull(row.source_row_id),
       response_time: toNumber(row.response_time),
       total_tokens: toNumber(row.total_tokens),
       tps: toNumber(row.tps),
@@ -433,6 +577,11 @@
       if (msg.timestamp) meta.push(`<span>${escapeHtml(formatTimestamp(msg.timestamp))}</span>`);
       if (msg.model_used) meta.push(`<span>${escapeHtml(shortModel(msg.model_used))}</span>`);
       if (msg.prompt_id) meta.push(`<span>Prompt ID: ${escapeHtml(msg.prompt_id)}</span>`);
+      if (msg.turn_id) meta.push(`<span>Turn ID: ${escapeHtml(msg.turn_id)}</span>`);
+      if (msg.prompt_version != null) meta.push(`<span>Prompt v${escapeHtml(String(msg.prompt_version))}</span>`);
+      if (msg.response_version != null) meta.push(`<span>Response v${escapeHtml(String(msg.response_version))}</span>`);
+      if (msg.source_row_id) meta.push(`<span>Source row: ${escapeHtml(msg.source_row_id)}</span>`);
+      if (isInactiveVariant(msg)) meta.push(`<span class="archive-status-pill archive-inactive-pill">Inactive variant</span>`);
 
       html += `<div class="archive-row-meta">${meta.join("")}</div>`;
       html += `<div class="archive-bubble-wrap">`;
@@ -444,6 +593,8 @@
           </div>
         `;
       }
+
+      html += renderAttachmentIndicator(msg);
 
       if (msg.bot_response) {
         html += `
@@ -491,11 +642,146 @@
 
     if (window.marked && typeof window.marked.parse === "function") {
       try {
-        return window.marked.parse(raw);
+        return sanitizeMarkdownHtml(window.marked.parse(escapeRawHtmlForMarkdown(raw), getSafeMarkedOptions()));
       } catch (_) {}
     }
 
     return `<div class="streaming-plain">${escapeHtml(raw).replace(/\n/g, "<br>")}</div>`;
+  }
+
+  function renderAttachmentIndicator(msg) {
+    if (!hasAttachmentContext(msg && msg.attachment_context)) return "";
+
+    return `
+      <div class="archive-attachment-note">
+        <span class="archive-attachment-icon" aria-hidden="true">📎</span>
+        <span>
+          <strong>Attachment context included</strong>
+          <small>Original file not included in archive.</small>
+        </span>
+      </div>
+    `;
+  }
+
+  let safeMarkedOptions = null;
+
+  function getSafeMarkedOptions() {
+    if (safeMarkedOptions) return safeMarkedOptions;
+
+    if (window.marked && typeof window.marked.Renderer === "function") {
+      const renderer = new window.marked.Renderer();
+      renderer.html = token => escapeHtml(token && token.text ? token.text : "");
+      safeMarkedOptions = { renderer };
+      return safeMarkedOptions;
+    }
+
+    safeMarkedOptions = {};
+    return safeMarkedOptions;
+  }
+
+  function escapeRawHtmlForMarkdown(text) {
+    return String(text || "").replace(
+      /<(?=\/?[a-z][a-z0-9:-]*(?:\s|>|\/)|!(?:doctype|--|\[CDATA\[)|\?)/gi,
+      "&lt;"
+    );
+  }
+
+  const SAFE_MARKDOWN_TAGS = new Set([
+    "a", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3", "h4", "h5", "h6",
+    "hr", "li", "ol", "p", "pre", "s", "span", "strong", "table", "tbody", "td", "th",
+    "thead", "tr", "ul"
+  ]);
+
+  const DROP_MARKDOWN_TAGS = new Set([
+    "script", "style", "iframe", "object", "embed", "link", "meta", "form", "input",
+    "button", "textarea", "select", "option", "svg", "math"
+  ]);
+
+  const SAFE_MARKDOWN_ATTRS = {
+    a: new Set(["href", "title", "target", "rel"]),
+    code: new Set(["class"]),
+    pre: new Set(["class"]),
+    span: new Set(["class"]),
+    td: new Set(["align"]),
+    th: new Set(["align"])
+  };
+
+  function sanitizeMarkdownHtml(html) {
+    const template = document.createElement("template");
+    template.innerHTML = String(html || "");
+
+    function cleanNode(node) {
+      if (node.nodeType === Node.COMMENT_NODE) {
+        node.remove();
+        return;
+      }
+
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        return;
+      }
+
+      const tagName = node.tagName.toLowerCase();
+
+      if (DROP_MARKDOWN_TAGS.has(tagName)) {
+        node.remove();
+        return;
+      }
+
+      Array.from(node.childNodes).forEach(cleanNode);
+
+      if (!SAFE_MARKDOWN_TAGS.has(tagName)) {
+        const parent = node.parentNode;
+        if (!parent) return;
+        while (node.firstChild) {
+          parent.insertBefore(node.firstChild, node);
+        }
+        node.remove();
+        return;
+      }
+
+      const allowedAttrs = SAFE_MARKDOWN_ATTRS[tagName] || new Set();
+      Array.from(node.attributes).forEach(attr => {
+        const attrName = attr.name.toLowerCase();
+        const attrValue = attr.value || "";
+
+        if (attrName.startsWith("on") || !allowedAttrs.has(attrName)) {
+          node.removeAttribute(attr.name);
+          return;
+        }
+
+        if (tagName === "a" && attrName === "href" && !isSafeMarkdownUrl(attrValue)) {
+          node.removeAttribute(attr.name);
+        }
+      });
+
+      if (tagName === "a" && node.getAttribute("target") === "_blank") {
+        node.setAttribute("rel", "noopener noreferrer");
+      }
+    }
+
+    Array.from(template.content.childNodes).forEach(cleanNode);
+    return template.innerHTML;
+  }
+
+  function isSafeMarkdownUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return false;
+
+    const compact = raw.replace(/[\u0000-\u001F\u007F\s]+/g, "").toLowerCase();
+    if (/^(javascript|vbscript|data):/.test(compact)) {
+      return false;
+    }
+
+    if (raw.startsWith("#") || raw.startsWith("/") || raw.startsWith("./") || raw.startsWith("../")) {
+      return true;
+    }
+
+    try {
+      const parsed = new URL(raw, window.location.href);
+      return ["http:", "https:", "mailto:", "tel:"].includes(parsed.protocol);
+    } catch (_) {
+      return false;
+    }
   }
 
   function pick(obj, keys) {
@@ -521,14 +807,69 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  function normalizeVersion(v) {
+    if (v == null || v === "") return null;
+    const s = String(v).trim();
+    if (!s || /^(null|none|undefined)$/i.test(s)) return null;
+    return s;
+  }
+
+  function normalizeActiveInChat(v) {
+    if (v == null || v === "") return null;
+    if (typeof v === "boolean") return v;
+
+    const s = String(v).trim().toLowerCase();
+    if (!s || /^(null|none|undefined)$/i.test(s)) return null;
+    if (["0", "false", "no", "n", "inactive"].includes(s)) return false;
+    if (["1", "true", "yes", "y", "active"].includes(s)) return true;
+    return null;
+  }
+
+  function isInactiveVariant(msg) {
+    return msg && msg.active_in_chat === false;
+  }
+
   function hasValue(v) {
     return v != null && String(v).trim() !== "";
+  }
+
+  function hasAttachmentContext(v) {
+    return normalizeAttachmentContext(v) !== null;
   }
 
   function toStringOrNull(v) {
     if (v == null) return null;
     const s = String(v);
     return s === "" ? null : s;
+  }
+
+  function normalizeAttachmentContext(v) {
+    if (v == null) return null;
+    const s = String(v).trim();
+    if (!s || /^(null|none|undefined)$/i.test(s)) return null;
+    return s;
+  }
+
+  function blankMsg() {
+    return {
+      id: cryptoId(),
+      user_message: "",
+      bot_response: "",
+      thoughts: "",
+      attachment_context: "",
+      timestamp: null,
+      model_used: null,
+      prompt_id: null,
+      turn_id: null,
+      prompt_version: null,
+      response_version: null,
+      active_in_chat: null,
+      source_row_id: null,
+      response_time: null,
+      total_tokens: null,
+      tps: null,
+      prompt_eval_tps: null
+    };
   }
 
   function formatTimestamp(ts) {
