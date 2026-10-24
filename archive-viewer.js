@@ -3,7 +3,10 @@
     sessions: [],
     activeSessionId: null,
     fileName: null,
-    fileType: null
+    fileType: null,
+    attachmentCache: new Map(),
+    imageCache: new Map(),
+    loadId: 0
   };
 
   const els = {
@@ -19,6 +22,10 @@
   bindUi();
 
   function bindUi() {
+    const preview = document.getElementById("imagePreview");
+    document.getElementById("imagePreviewClose").addEventListener("click", closeImagePreview);
+    preview.addEventListener("close", () => document.getElementById("imagePreviewImage").removeAttribute("src"));
+    preview.addEventListener("click", event => { if (event.target === preview) closeImagePreview(); });
     els.pickFileBtn.addEventListener("click", () => els.fileInput.click());
     els.pickFileBtnSecondary.addEventListener("click", () => els.fileInput.click());
     els.fileInput.addEventListener("change", (e) => {
@@ -52,17 +59,22 @@
   }
 
   function loadFile(file) {
+    const loadId = ++state.loadId;
     const reader = new FileReader();
     reader.onload = () => {
+      if (loadId !== state.loadId) return;
       try {
-        const text = String(reader.result || "");
+        const text = String(reader.result || "").replace(/^\uFEFF/, "");
         const type = detectType(file.name, text);
         const sessions = parseExport(type, text, file.name);
 
+        state.attachmentCache.clear();
+        state.imageCache.clear();
+        closeImagePreview();
         state.fileName = file.name;
         state.fileType = type;
         state.sessions = sessions;
-        state.activeSessionId = sessions[0] ? sessions[0].session_id : null;
+        state.activeSessionId = sessions[0] ? sessions[0].key : null;
 
         renderSidebar();
         renderChat();
@@ -71,7 +83,8 @@
         renderError(err && err.message ? err.message : String(err));
       }
     };
-    reader.onerror = () => renderError("Failed to read file.");
+    reader.onerror = () => { if (loadId === state.loadId) renderError("Failed to read file."); };
+    els.fileInput.value = "";
     reader.readAsText(file);
   }
 
@@ -94,15 +107,39 @@
     return normalizeMarkdown(text, fileName);
   }
 
-  function normalizeJson(rows) {
-    if (!Array.isArray(rows)) {
-      throw new Error("JSON export must be an array of rows.");
+  function normalizeJson(payload) {
+    if (Array.isArray(payload)) return buildSessionsFromRows(payload);
+    if (!payload || payload.format !== "llm-controller-ce-chat-backup") {
+      throw new Error("Expected a CE chat backup or a legacy JSON array of chat rows.");
     }
-    return buildSessionsFromRows(rows);
+    if (payload.version !== 1) throw new Error("Unsupported CE chat backup version: " + payload.version);
+    for (const field of ["chats", "projects", "chat_sessions"]) {
+      if (!Array.isArray(payload[field])) throw new Error("CE chat backup requires a " + field + " array.");
+    }
+    const sessions = buildSessionsFromRows(payload.chats);
+    const bySession = new Map(sessions.map(session => [session.key, session]));
+    const projects = new Map();
+    payload.projects.forEach(project => {
+      if (!isRecord(project)) throw new Error("Invalid project record in CE backup.");
+      projects.set(sessionKey(project.user_id, project.id), project);
+    });
+    payload.chat_sessions.forEach(mapping => {
+      if (!isRecord(mapping) || !hasValue(mapping.session_id)) throw new Error("Invalid conversation mapping in CE backup.");
+      const key = sessionKey(mapping.user_id, mapping.session_id);
+      let session = bySession.get(key);
+      if (!session) {
+        session = { key, session_id: String(mapping.session_id), user_id: toStringOrNull(mapping.user_id), messages: [] };
+        finalizeSession(session);
+        sessions.push(session);
+        bySession.set(key, session);
+      }
+      session.project_id = mapping.project_id;
+      session.project = projects.get(sessionKey(mapping.user_id, mapping.project_id));
+    });
+    return sortSessions(sessions);
   }
 
   function normalizeCsv(rows) {
-    if (!rows.length) throw new Error("CSV export is empty.");
     return buildSessionsFromRows(rows);
   }
 
@@ -115,6 +152,7 @@
     let currentSession = null;
     let currentMsg = null;
     let mode = null;
+    let recognized = false;
 
     function flushMessage() {
       if (!currentSession || !currentMsg) return;
@@ -136,7 +174,7 @@
     function ensureSession(title) {
       flushMessage();
       currentSession = {
-        session_id: slugify(title || "imported-chat-" + (sessions.length + 1)),
+        session_id: slugify(title || "imported-chat") + "-" + (sessions.length + 1),
         session_name: (title || "Imported Chat " + (sessions.length + 1)).trim(),
         source: "markdown",
         messages: [],
@@ -149,6 +187,7 @@
       const line = rawLine.trimEnd();
 
       if (/^#\s+/.test(line) || /^##\s+Session:/i.test(line) || /^##\s+Chat:/i.test(line)) {
+        recognized = true;
         const title = line
           .replace(/^##\s+Session:\s*/i, "")
           .replace(/^##\s+Chat:\s*/i, "")
@@ -162,6 +201,7 @@
       }
 
       if (/^###\s+User/i.test(line) || /^\*\*User:\*\*/i.test(line)) {
+        recognized = true;
         flushMessage();
         currentMsg = blankMsg();
         mode = "user";
@@ -171,6 +211,7 @@
       }
 
       if (/^###\s+Assistant/i.test(line) || /^\*\*Assistant:\*\*/i.test(line) || /^\*\*Bot:\*\*/i.test(line)) {
+        recognized = true;
         if (!currentMsg) currentMsg = blankMsg();
         mode = "assistant";
         const inline = line
@@ -182,6 +223,7 @@
       }
 
       if (/^###\s+Thoughts/i.test(line) || /^\*\*Thoughts:\*\*/i.test(line)) {
+        recognized = true;
         if (!currentMsg) currentMsg = blankMsg();
         mode = "thoughts";
         const inline = line.replace(/^###\s+Thoughts\s*:?\s*/i, "").replace(/^\*\*Thoughts:\*\*\s*/i, "");
@@ -190,6 +232,7 @@
       }
 
       if (/^###\s+Attachment Context/i.test(line) || /^\*\*Attachment Context:\*\*/i.test(line) || /^\*\*attachment_context:\*\*/i.test(line) || /^attachment_context\s*:/i.test(line)) {
+        recognized = true;
         if (!currentMsg) currentMsg = blankMsg();
         mode = "attachment_context";
         const inline = line
@@ -228,7 +271,7 @@
 
     flushMessage();
 
-    if (!sessions.length) {
+    if (!sessions.length || !recognized) {
       throw new Error("Markdown export format was not recognized.");
     }
 
@@ -272,9 +315,13 @@
       rows.push(row);
     }
 
-    if (!rows.length) return [];
+    if (inQuotes) throw new Error("CSV contains an unterminated quoted field.");
+    if (!rows.length) throw new Error("CSV export is empty.");
 
     const headers = rows[0].map(h => h.trim());
+    if (!isChatRow(Object.fromEntries(headers.map(header => [header, ""])))) {
+      throw new Error("CSV headers do not contain recognized conversation or message fields.");
+    }
     return rows.slice(1)
       .filter(r => r.some(v => String(v || "").trim() !== ""))
       .map(r => {
@@ -319,7 +366,7 @@
       rows.push(row);
     }
 
-    return rows.length ? rows : null;
+    return rows;
   }
 
   function isCoreExportHeader(headers) {
@@ -396,14 +443,20 @@
     const bySession = new Map();
 
     for (const raw of rows) {
+      if (!isChatRow(raw)) {
+        throw new Error("Archive contains an unrecognized chat row.");
+      }
       const row = normalizeRow(raw);
       if (!row.session_id) {
         row.session_id = "session-" + (row.id || cryptoId());
       }
 
-      if (!bySession.has(row.session_id)) {
-        bySession.set(row.session_id, {
-          session_id: row.session_id,
+      const key = sessionKey(row.user_id, row.session_id);
+      if (!bySession.has(key)) {
+        bySession.set(key, {
+          key,
+          user_id: toStringOrNull(row.user_id),
+          session_id: String(row.session_id),
           session_name: row.session_name || null,
           source: "flat-export",
           messages: [],
@@ -411,7 +464,7 @@
         });
       }
 
-      const session = bySession.get(row.session_id);
+      const session = bySession.get(key);
 
       if (!session.session_name && row.session_name) {
         session.session_name = row.session_name;
@@ -421,7 +474,8 @@
         !hasValue(row.user_message) &&
         !hasValue(row.bot_response) &&
         !hasValue(row.thoughts) &&
-        !hasAttachmentContext(row.attachment_context);
+        !hasAttachmentContext(row.attachment_context) &&
+        !hasValue(row.turn_id) && !hasValue(row.prompt_id);
 
       if (!isHeaderish) {
         session.messages.push(cleanMessage(row));
@@ -440,6 +494,7 @@
 
   function normalizeRow(raw) {
     return {
+      user_id: pick(raw, ["user_id", "userId"]),
       id: pick(raw, ["id", "ID"]),
       session_id: pick(raw, ["session_id", "sessionId", "chat_id", "chatId"]),
       session_name: pick(raw, ["session_name", "sessionName", "chat_name", "chatName"]),
@@ -485,6 +540,7 @@
   }
 
   function finalizeSession(session) {
+    session.key = session.key || sessionKey(session.user_id, session.session_id);
     session.messages.sort((a, b) => {
       const ta = toNumber(a.timestamp) || 0;
       const tb = toNumber(b.timestamp) || 0;
@@ -498,8 +554,36 @@
     }
 
     if (!session.last_timestamp) {
-      session.last_timestamp = Math.max(0, ...session.messages.map(m => toNumber(m.timestamp) || 0)) || null;
+      session.last_timestamp = session.messages.reduce((latest, msg) => Math.max(latest, toNumber(msg.timestamp) || 0), 0) || null;
     }
+    // A CE turn holds every prompt edit and response regeneration. Source rows
+    // describe revision ancestry, not additional chronological conversation turns.
+    const turns = new Map();
+    session.messages.forEach((msg, index) => {
+      const key = msg.turn_id ? "turn:" + msg.turn_id : "row:" + index;
+      if (!turns.has(key)) turns.set(key, { messages: [], selected: 0 });
+      turns.get(key).messages.push(msg);
+    });
+    session.turns = Array.from(turns.values());
+    session.turns.forEach(turn => {
+      turn.messages.sort((a, b) => (toNumber(a.prompt_version) || 0) - (toNumber(b.prompt_version) || 0) ||
+        (toNumber(a.response_version) || 0) - (toNumber(b.response_version) || 0));
+      const active = turn.messages.findIndex(msg => msg.active_in_chat === true);
+      turn.selected = active >= 0 ? active : 0;
+    });
+  }
+
+  function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function isChatRow(value) {
+    return isRecord(value) && ["session_id", "sessionId", "chat_id", "chatId", "user_message", "userMessage", "prompt", "user", "bot_response", "botResponse", "response", "assistant"]
+      .some(key => Object.hasOwn(value, key));
+  }
+
+  function sessionKey(userId, sessionId) {
+    return JSON.stringify([toStringOrNull(userId), String(sessionId)]);
   }
 
   function sortSessions(sessions) {
@@ -524,7 +608,7 @@
 
     state.sessions.forEach(session => {
       const li = document.createElement("li");
-      if (session.session_id === state.activeSessionId) {
+      if (session.key === state.activeSessionId) {
         li.classList.add("archive-session-active");
       }
 
@@ -534,12 +618,12 @@
       btn.innerHTML = `
         <div class="archive-session-name">${escapeHtml(session.session_name || session.session_id)}</div>
         <div class="archive-session-sub">
-          <span>${session.messages.length} rows</span>
+          <span>${session.turns.length} turns${session.user_id ? " · User " + escapeHtml(session.user_id) : ""}</span>
           <span>${escapeHtml(formatTimestamp(session.last_timestamp))}</span>
         </div>
       `;
       btn.addEventListener("click", () => {
-        state.activeSessionId = session.session_id;
+        state.activeSessionId = session.key;
         renderSidebar();
         renderChat();
       });
@@ -550,13 +634,13 @@
   }
 
   function renderChat() {
-    const session = state.sessions.find(s => s.session_id === state.activeSessionId);
+    const session = state.sessions.find(s => s.key === state.activeSessionId);
 
     if (!session) {
       els.chatMessages.innerHTML = `
         <div class="archive-empty-state">
-          <h2>No chat selected</h2>
-          <p>Select a chat from the archive sidebar.</p>
+          <h2>No chats found</h2>
+          <p>This archive contains no conversations.</p>
         </div>
       `;
       return;
@@ -568,35 +652,45 @@
         <p>
           <span class="archive-file-pill">${escapeHtml(session.session_id)}</span>
           &nbsp; Read-only archive view
+          ${session.project_id != null ? " · Project: " + escapeHtml(session.project?.name || String(session.project_id)) : ""}
         </p>
       </div>
     `;
 
-    session.messages.forEach(msg => {
+    if (!session.turns.length) html += `<p class="archive-chat-heading">This conversation has no messages.</p>`;
+    session.turns.forEach((turn, turnIndex) => {
+      const msg = turn.messages[turn.selected];
+      if (turn.messages.length > 1) {
+        html += `<div class="archive-variants"><label>Turn ${turnIndex + 1} · View version
+          <select data-turn="${turnIndex}">${turn.messages.map((variant, index) =>
+            `<option value="${index}" ${index === turn.selected ? "selected" : ""}>${escapeHtml(variantLabel(variant, index))}</option>`
+          ).join("")}</select></label><small>Browsing a version does not change the archived selection or later turns.</small></div>`;
+      }
       const meta = [];
+      if (msg.turn_id || msg.source_row_id) meta.push(`<span>Row: ${escapeHtml(String(msg.id))}</span>`);
       if (msg.timestamp) meta.push(`<span>${escapeHtml(formatTimestamp(msg.timestamp))}</span>`);
-      if (msg.model_used) meta.push(`<span>${escapeHtml(shortModel(msg.model_used))}</span>`);
+      if (msg.model_used) meta.push(`<span title="${escapeHtml(msg.model_used)}">${escapeHtml(shortModel(msg.model_used))}</span>`);
       if (msg.prompt_id) meta.push(`<span>Prompt ID: ${escapeHtml(msg.prompt_id)}</span>`);
       if (msg.turn_id) meta.push(`<span>Turn ID: ${escapeHtml(msg.turn_id)}</span>`);
       if (msg.prompt_version != null) meta.push(`<span>Prompt v${escapeHtml(String(msg.prompt_version))}</span>`);
       if (msg.response_version != null) meta.push(`<span>Response v${escapeHtml(String(msg.response_version))}</span>`);
       if (msg.source_row_id) meta.push(`<span>Source row: ${escapeHtml(msg.source_row_id)}</span>`);
+      if (msg.active_in_chat === true) meta.push(`<span class="archive-status-pill archive-active-pill">Active in archive</span>`);
       if (isInactiveVariant(msg)) meta.push(`<span class="archive-status-pill archive-inactive-pill">Inactive variant</span>`);
 
       html += `<div class="archive-row-meta">${meta.join("")}</div>`;
       html += `<div class="archive-bubble-wrap">`;
 
-      if (msg.user_message) {
+      if (msg.user_message || msg.attachment_context) {
         html += `
           <div class="chat-bubble user">
             <div class="archive-bubble-body">${renderRich(msg.user_message)}</div>
+            ${renderAttachments(msg.attachment_context)}
           </div>
         `;
       }
 
-      html += renderAttachmentIndicator(msg);
-
-      if (msg.bot_response) {
+      if (msg.bot_response || msg.thoughts) {
         html += `
           <div class="chat-bubble bot">
             <div class="archive-bubble-body">${renderRich(msg.bot_response)}</div>
@@ -609,21 +703,37 @@
             <div class="archive-footer">
               ${msg.tps != null ? `TPS: ${escapeHtml(String(msg.tps))} &nbsp;` : ""}
               ${msg.total_tokens != null ? `Tokens: ${escapeHtml(String(msg.total_tokens))} &nbsp;` : ""}
+              ${msg.prompt_eval_tps != null ? `Prompt TPS: ${escapeHtml(String(msg.prompt_eval_tps))} &nbsp;` : ""}
               ${msg.response_time != null ? `Time: ${escapeHtml(String(msg.response_time))}s` : ""}
             </div>
           </div>
         `;
       }
+      if (!msg.bot_response) html += `<p class="archive-row-meta">No final response recorded.</p>`;
 
       html += `</div>`;
     });
 
     els.chatMessages.innerHTML = html;
+    bindImages(els.chatMessages);
+    els.chatMessages.querySelectorAll("select[data-turn]").forEach(select => {
+      select.addEventListener("change", () => {
+        const container = document.querySelector(".archive-chat-container");
+        const scrollTop = container.scrollTop;
+        session.turns[Number(select.dataset.turn)].selected = Number(select.value);
+        renderChat();
+        container.scrollTop = scrollTop;
+        els.chatMessages.querySelector(`select[data-turn="${select.dataset.turn}"]`).focus({ preventScroll: true });
+      });
+    });
     const chatContainer = document.querySelector(".archive-chat-container");
     if (chatContainer) chatContainer.scrollTop = 0;
   }
 
   function renderError(message) {
+    closeImagePreview();
+    state.attachmentCache.clear();
+    state.imageCache.clear();
     state.sessions = [];
     state.activeSessionId = null;
     els.chatHistory.innerHTML = `<li><span>Import failed</span></li>`;
@@ -649,18 +759,112 @@
     return `<div class="streaming-plain">${escapeHtml(raw).replace(/\n/g, "<br>")}</div>`;
   }
 
-  function renderAttachmentIndicator(msg) {
-    if (!hasAttachmentContext(msg && msg.attachment_context)) return "";
+  function variantLabel(msg, index) {
+    const versions = [msg.prompt_version != null ? "Prompt v" + msg.prompt_version : "Version " + (index + 1),
+      msg.response_version != null ? "response v" + msg.response_version : null];
+    versions.push(msg.active_in_chat === true ? "active in archive" : msg.active_in_chat === false ? "inactive" : "selection unknown");
+    return versions.filter(Boolean).join(" · ");
+  }
 
-    return `
-      <div class="archive-attachment-note">
-        <span class="archive-attachment-icon" aria-hidden="true">📎</span>
-        <span>
-          <strong>Attachment context included</strong>
-          <small>Original file not included in archive.</small>
-        </span>
-      </div>
-    `;
+  function renderAttachments(context) {
+    if (!context) return "";
+    let parsed = state.attachmentCache.get(context);
+    if (!parsed) {
+      try { parsed = JSON.parse(context); } catch (_) { parsed = null; }
+      if (!isRecord(parsed) || parsed.type !== "llm-controller-attachments") {
+        parsed = { notice: "Attachment context included. Original file data is not available in a recognized format." };
+      } else if (![1, 2].includes(parsed.version) || !Array.isArray(parsed.attachments)) {
+        parsed = { notice: "Attachment data is invalid or uses an unsupported version." };
+      }
+      state.attachmentCache.set(context, parsed);
+    }
+    if (parsed.notice) return `<div class="archive-attachment-note">${escapeHtml(parsed.notice)}</div>`;
+    return `<div class="archive-attachments">${parsed.attachments.map(attachment => {
+      if (!isRecord(attachment)) return `<div class="archive-attachment-note">Invalid attachment record.</div>`;
+      const name = toStringOrNull(attachment.name) || "Attachment";
+      if (attachment.kind === "image") {
+        const source = validatedImageSource(attachment.data_url, attachment.mime_type);
+        return source ? imageMarkup(source, name) : `<div class="archive-attachment-note">${escapeHtml(name)} — ${attachment.data_url ? "Image data is invalid or unsupported." : "Image bytes are not included."}</div>`;
+      }
+      const content = typeof attachment.content === "string" ? attachment.content : "";
+      return content ? `<details class="archive-attachment-text"><summary>${escapeHtml(name)}</summary><pre>${escapeHtml(content)}</pre></details>` :
+        `<div class="archive-attachment-note">${escapeHtml(name)} — Attachment metadata only; file data is not included.</div>`;
+    }).join("")}</div>`;
+  }
+
+  function imageMarkup(source, name) {
+    return `<span class="archive-image"><img src="${escapeHtml(source)}" alt="${escapeHtml(name)}" loading="lazy" decoding="async"><span class="archive-image-caption">${escapeHtml(name)}</span></span>`;
+  }
+
+  function normalizeImageMime(value) {
+    const mime = String(value || "").toLowerCase().trim();
+    return ({ "image/heic": "image/heif", "image/heic-sequence": "image/heif", "image/heif-sequence": "image/heif",
+      "image/x-tiff": "image/tiff", "image/x-bmp": "image/bmp", "image/x-ms-bmp": "image/bmp" })[mime] || mime;
+  }
+
+  function validatedImageSource(value, declaredMime) {
+    if (typeof value !== "string") return null;
+    const cached = state.imageCache.get(value);
+    if (cached !== undefined) return cached && (!declaredMime || normalizeImageMime(declaredMime) === cached.mime) ? cached.source : null;
+    const match = /^data:(image\/[a-z0-9+-]+);base64,([A-Za-z0-9+/_-]+={0,2})$/i.exec(value.trim());
+    let result = null;
+    if (match) {
+      const mime = normalizeImageMime(match[1]);
+      const encoded = match[2].replace(/-/g, "+").replace(/_/g, "/");
+      try {
+        // Inspect the signature only; the browser decodes the complete image lazily.
+        const head = atob(encoded.slice(0, 256));
+        const valid = encoded.length % 4 === 0 && (
+          (mime === "image/png" && head.startsWith("\x89PNG\r\n\x1a\n")) ||
+          (mime === "image/jpeg" && head.startsWith("\xff\xd8\xff")) ||
+          (mime === "image/gif" && /^GIF8[79]a/.test(head)) ||
+          (mime === "image/webp" && head.startsWith("RIFF") && head.slice(8, 12) === "WEBP") ||
+          (mime === "image/bmp" && head.length >= 14 && head.startsWith("BM")) ||
+          (mime === "image/tiff" && ["II\x2a\x00", "MM\x00\x2a", "II\x2b\x00", "MM\x00\x2b"].includes(head.slice(0, 4))) ||
+          (["image/avif", "image/heif"].includes(mime) && head.slice(4, 8) === "ftyp" &&
+            (mime === "image/avif" ? /^(avif|avis|mif1|msf1)$/.test(head.slice(8, 12)) : /^(heic|heix|heim|heis|hevc|hevx|hevm|hevs|mif1|msf1)$/.test(head.slice(8, 12))))
+        );
+        if (valid) result = { mime, source: `data:${mime};base64,${encoded}` };
+      } catch (_) {}
+    }
+    state.imageCache.set(value, result);
+    return result && (!declaredMime || normalizeImageMime(declaredMime) === result.mime) ? result.source : null;
+  }
+
+  function bindImages(root) {
+    root.querySelectorAll(".archive-image img").forEach(img => {
+      const wrapper = img.parentElement;
+      const caption = wrapper.querySelector(".archive-image-caption");
+      const fail = () => {
+        caption.textContent = `${img.alt || "Image"} — Preview unavailable: damaged image or unsupported browser format.`;
+        img.remove();
+      };
+      const ready = () => { img.classList.add("archive-image-ready"); };
+      img.addEventListener("load", ready, { once: true });
+      img.addEventListener("error", fail, { once: true });
+      img.tabIndex = 0;
+      img.setAttribute("role", "button");
+      img.setAttribute("aria-label", "Enlarge " + (img.alt || "image"));
+      const open = () => {
+        const dialog = document.getElementById("imagePreview");
+        const preview = document.getElementById("imagePreviewImage");
+        preview.src = img.src;
+        preview.alt = img.alt;
+        document.getElementById("imagePreviewCaption").textContent = img.alt;
+        dialog.showModal();
+      };
+      img.addEventListener("click", open);
+      img.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
+      });
+      if (img.complete) { if (img.naturalWidth) ready(); else fail(); }
+    });
+  }
+
+  function closeImagePreview() {
+    const dialog = document.getElementById("imagePreview");
+    if (dialog.open) dialog.close();
+    document.getElementById("imagePreviewImage").removeAttribute("src");
   }
 
   let safeMarkedOptions = null;
@@ -671,6 +875,11 @@
     if (window.marked && typeof window.marked.Renderer === "function") {
       const renderer = new window.marked.Renderer();
       renderer.html = token => escapeHtml(token && token.text ? token.text : "");
+      renderer.image = token => {
+        const source = validatedImageSource(token.href);
+        const label = token.text || "Embedded image";
+        return source ? imageMarkup(source, label) : `<span>${escapeHtml(label)} (image unavailable offline)</span>`;
+      };
       safeMarkedOptions = { renderer };
       return safeMarkedOptions;
     }
@@ -689,7 +898,7 @@
   const SAFE_MARKDOWN_TAGS = new Set([
     "a", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3", "h4", "h5", "h6",
     "hr", "li", "ol", "p", "pre", "s", "span", "strong", "table", "tbody", "td", "th",
-    "thead", "tr", "ul"
+    "thead", "tr", "ul", "img"
   ]);
 
   const DROP_MARKDOWN_TAGS = new Set([
@@ -703,7 +912,8 @@
     pre: new Set(["class"]),
     span: new Set(["class"]),
     td: new Set(["align"]),
-    th: new Set(["align"])
+    th: new Set(["align"]),
+    img: new Set(["src", "alt", "loading", "decoding"])
   };
 
   function sanitizeMarkdownHtml(html) {
@@ -750,6 +960,9 @@
         }
 
         if (tagName === "a" && attrName === "href" && !isSafeMarkdownUrl(attrValue)) {
+          node.removeAttribute(attr.name);
+        }
+        if (tagName === "img" && attrName === "src" && !validatedImageSource(attrValue)) {
           node.removeAttribute(attr.name);
         }
       });
@@ -845,6 +1058,7 @@
 
   function normalizeAttachmentContext(v) {
     if (v == null) return null;
+    if (isRecord(v)) return JSON.stringify(v);
     const s = String(v).trim();
     if (!s || /^(null|none|undefined)$/i.test(s)) return null;
     return s;
